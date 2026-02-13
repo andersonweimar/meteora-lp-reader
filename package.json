@@ -8,8 +8,8 @@
   },
   "dependencies": {
     "@meteora-ag/dlmm": "1.1.21",
-    "@solana/web3.js": "^1.95.4",
-    "express": "^4.19.2"
+    "@solana/web3.js": "1.95.4",
+    "express": "4.19.2"
   },
   "engines": {
     "node": "20.x"
