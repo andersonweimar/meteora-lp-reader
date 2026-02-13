@@ -1,15 +1,16 @@
 {
-  "name": "meteora-dlmm-backend",
+  "name": "meteora-lp-reader",
   "version": "1.0.0",
   "main": "server.js",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "^1.1.21",
-    "@solana/web3.js": "^1.98.0",
+    "@solana/web3.js": "^1.95.4",
     "axios": "^1.6.8",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2"
   },
   "engines": {
