@@ -1,159 +1,77 @@
 const express = require("express");
 const axios = require("axios");
 const { Connection, PublicKey } = require("@solana/web3.js");
-
-// DLMM SDK (CommonJS compat)
-const dlmmPkg = require("@meteora-ag/dlmm");
-const DLMM = dlmmPkg.default || dlmmPkg;
+const DLMM = require("@meteora-ag/dlmm").default; // Forçando o .default para CommonJS
 
 const app = express();
 app.use(express.json());
 
-// ===== ENV =====
-const HELIUS_KEY = (process.env.HELIUS_API_KEY || "").trim();
-
-// Se não tiver Helius, cai no RPC público (pode ser mais lento / rate limit)
-const RPC_ENDPOINT = HELIUS_KEY
-  ? `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(HELIUS_KEY)}`
-  : "https://api.mainnet-beta.solana.com";
-
+const HELIUS_KEY = "395619ba-76c1-46fe-ab8e-d38a2fd8a455"; 
+const RPC_ENDPOINT = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
 const connection = new Connection(RPC_ENDPOINT, "confirmed");
 
-// ===== Helpers =====
-async function meteoraPositionMeta(positionId) {
-  // retorna { address, pair_address, owner, ... }
-  const url = `https://dlmm-api.meteora.ag/position/${positionId}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return data;
+// Helper para converter BigInt/BN para Number real considerando decimais
+function toUiAmount(amount, decimals) {
+    if (!amount) return 0;
+    const amtStr = amount.toString();
+    return Number(amtStr) / Math.pow(10, decimals);
 }
-
-async function meteoraPoolSpot(poolAddr) {
-  const url = `https://dlmm.datapi.meteora.ag/pools/${poolAddr}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  const px = Number(data?.current_price ?? data?.price ?? NaN);
-  return Number.isFinite(px) ? px : null;
-}
-
-function toNumberAmount(raw, decimals) {
-  // SDK pode devolver bigint, string, BN-like, number
-  if (raw === null || raw === undefined) return null;
-
-  try {
-    // BN-like
-    if (typeof raw === "object" && raw.toString) raw = raw.toString();
-    if (typeof raw === "string") {
-      if (!raw.length) return null;
-      const bi = BigInt(raw);
-      const div = 10n ** BigInt(decimals);
-      const intPart = bi / div;
-      const fracPart = bi % div;
-
-      // converte pra Number com segurança “boa o bastante” p/ dashboard
-      const frac = Number(fracPart) / Number(div);
-      return Number(intPart) + frac;
-    }
-    if (typeof raw === "bigint") {
-      const div = 10n ** BigInt(decimals);
-      const intPart = raw / div;
-      const fracPart = raw % div;
-      const frac = Number(fracPart) / Number(div);
-      return Number(intPart) + frac;
-    }
-    const n = Number(raw);
-    if (!Number.isFinite(n)) return null;
-    return n / Math.pow(10, decimals);
-  } catch {
-    return null;
-  }
-}
-
-// ===== Routes =====
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "meteora-dlmm-backend",
-    endpoints: ["/debug", "/lp/:positionId"],
-  });
-});
-
-app.get("/debug", async (req, res) => {
-  // pra tu saber se o Render tá passando env e se RPC tá respondendo
-  try {
-    const version = await connection.getVersion();
-    res.json({
-      ok: true,
-      heliusKeyPresent: HELIUS_KEY.length > 0,
-      rpcEndpoint: RPC_ENDPOINT.includes("helius") ? "helius" : "public",
-      solanaVersion: version,
-    });
-  } catch (e) {
-    res.json({
-      ok: false,
-      heliusKeyPresent: HELIUS_KEY.length > 0,
-      rpcEndpoint: RPC_ENDPOINT.includes("helius") ? "helius" : "public",
-      error: String(e?.message || e),
-    });
-  }
-});
 
 app.get("/lp/:positionId", async (req, res) => {
-  const positionId = (req.params.positionId || "").trim();
-  if (!positionId) return res.status(400).json({ ok: false, error: "missing positionId" });
+    const { positionId } = req.params;
+    
+    try {
+        // 1. Pegar meta via API (necessário para achar o par)
+        const metaUrl = `https://dlmm-api.meteora.ag/position/${positionId}`;
+        const { data: meta } = await axios.get(metaUrl);
+        const poolAddr = meta.pair_address;
 
-  try {
-    // 1) meta (pool + owner)
-    const meta = await meteoraPositionMeta(positionId);
-    const poolAddr = meta?.pair_address;
-    if (!poolAddr) return res.status(404).json({ ok: false, error: "pool not found for position", meta });
+        // 2. Criar instância da Pool e da Posição
+        const poolPk = new PublicKey(poolAddr);
+        const posPk = new PublicKey(positionId);
+        
+        // Carrega a pool e os dados on-chain (incluindo bin arrays)
+        const dlmmPool = await DLMM.create(connection, poolPk);
+        const positionData = await dlmmPool.getPosition(posPk);
 
-    // 2) spot
-    const spot = await meteoraPoolSpot(poolAddr);
+        if (!positionData) {
+            throw new Error("Não foi possível carregar os dados da posição on-chain.");
+        }
 
-    // 3) SDK on-chain calc
-    const poolPk = new PublicKey(poolAddr);
-    const posPk = new PublicKey(positionId);
+        // 3. Pegar Preço Spot (API ou On-chain)
+        const spotPrice = Number(dlmmPool.getRealTimePrice());
 
-    const dlmmPool = await DLMM.create(connection, poolPk);
-    const position = await dlmmPool.getPosition(posPk);
+        // 4. CÁLCULO DOS SALDOS (O segredo está aqui)
+        // O SDK preenche positionData.position com os saldos calculados após ler os bins
+        const rawX = positionData.position.totalXAmount;
+        const rawY = positionData.position.totalYAmount;
 
-    // token info
-    const tokenX = dlmmPool.tokenX;
-    const tokenY = dlmmPool.tokenY;
+        const q_sol = toUiAmount(rawX, dlmmPool.tokenX.decimal);
+        const u_usdc = toUiAmount(rawY, dlmmPool.tokenY.decimal);
 
-    // totalXAmount / totalYAmount (raw base units)
-    const q_sol = toNumberAmount(position?.totalXAmount, tokenX?.decimal ?? 9);
-    const u_usdc = toNumberAmount(position?.totalYAmount, tokenY?.decimal ?? 6);
+        // 5. Net Worth
+        const lp_total_usd = (q_sol * spotPrice) + u_usdc;
 
-    let lp_total_usd = null;
-    if (Number.isFinite(spot) && q_sol !== null && u_usdc !== null) {
-      lp_total_usd = (q_sol * spot) + u_usdc;
+        return res.json({
+            ok: true,
+            positionId,
+            pool: poolAddr,
+            tokenXMint: dlmmPool.tokenX.publicKey.toBase58(),
+            tokenYMint: dlmmPool.tokenY.publicKey.toBase58(),
+            spot: spotPrice,
+            q_sol,
+            u_usdc,
+            lp_total_usd,
+            // Debug para saber se a posição está fora de range
+            activeBinId: dlmmPool.activeBinId,
+            positionRange: `${positionData.position.lowerBinId} -> ${positionData.position.upperBinId}`
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ ok: false, error: e.message });
     }
-
-    return res.json({
-      ok: true,
-      positionId,
-      pool: poolAddr,
-      owner: meta?.owner ?? null,
-      rpc: RPC_ENDPOINT.includes("helius") ? "helius" : "public",
-      heliusKeyPresent: HELIUS_KEY.length > 0,
-
-      tokenXMint: tokenX?.publicKey?.toBase58?.() ?? tokenX?.mint?.toBase58?.() ?? null,
-      tokenYMint: tokenY?.publicKey?.toBase58?.() ?? tokenY?.mint?.toBase58?.() ?? null,
-
-      spot,
-      q_sol,
-      u_usdc,
-      lp_total_usd,
-
-      meta
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: String(e?.message || e),
-    });
-  }
 });
 
 const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`meteora-lp-reader listening on :${port}`));
+app.listen(port, () => console.log(`Meteora Backend Online na porta ${port}`));
