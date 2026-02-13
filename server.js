@@ -1,89 +1,89 @@
 const express = require("express");
+const axios = require("axios");
+const { Connection, PublicKey } = require("@solana/web3.js");
+const DLMM = require("@meteora-ag/dlmm").default;
 
 const app = express();
 app.use(express.json());
 
+const PORT = process.env.PORT || 10000;
 const HELIUS_KEY = process.env.HELIUS_API_KEY || "";
-const HELIUS_RPC = HELIUS_KEY
+const RPC_ENDPOINT = HELIUS_KEY
   ? `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(HELIUS_KEY)}`
-  : "";
+  : "https://api.mainnet-beta.solana.com";
 
-const MINT_WSOL = "So11111111111111111111111111111111111111112";
-const MINT_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const connection = new Connection(RPC_ENDPOINT, "confirmed");
 
 // ---------- helpers ----------
-async function fetchJson(url, opts = {}, retries = 2) {
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const res = await fetch(url, opts);
-      const txt = await res.text();
-      const json = txt ? JSON.parse(txt) : null;
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${txt}`);
-      return json;
-    } catch (e) {
-      lastErr = e;
-      await new Promise(r => setTimeout(r, 250 * (i + 1)));
+function toBigIntSafe(x) {
+  // aceita BN, BigInt, number, string
+  try {
+    if (x === null || x === undefined) return null;
+    if (typeof x === "bigint") return x;
+    if (typeof x === "number") return BigInt(Math.trunc(x));
+    if (typeof x === "string") {
+      if (!x.length) return null;
+      // pode vir "123.45" (não deveria) — nesse caso falha e retorna null
+      if (x.includes(".")) return null;
+      return BigInt(x);
     }
+    // BN.js tem toString()
+    if (typeof x.toString === "function") {
+      const s = x.toString();
+      if (!s || s.includes(".")) return null;
+      return BigInt(s);
+    }
+    return null;
+  } catch {
+    return null;
   }
-  throw lastErr;
+}
+
+function toDecimalString(amountBigInt, decimals) {
+  // retorna string decimal exata (sem perder precisão)
+  if (amountBigInt === null) return null;
+  const d = Number(decimals || 0);
+  const sign = amountBigInt < 0n ? "-" : "";
+  const a = amountBigInt < 0n ? -amountBigInt : amountBigInt;
+
+  const base = 10n ** BigInt(d);
+  const intPart = a / base;
+  const fracPart = a % base;
+
+  if (d === 0) return sign + intPart.toString();
+  const frac = fracPart.toString().padStart(d, "0").replace(/0+$/, "");
+  return sign + intPart.toString() + (frac ? "." + frac : "");
+}
+
+function toNumberApprox(amountBigInt, decimals) {
+  // número aproximado (serve pra cálculo de USD no dashboard)
+  const s = toDecimalString(amountBigInt, decimals);
+  if (s === null) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
 }
 
 async function meteoraPosition(positionId) {
-  // endpoint que tu achou e funciona:
+  // endpoint que tu validou
   const url = `https://dlmm-api.meteora.ag/position/${positionId}`;
-  return fetchJson(url, {}, 2);
+  const { data } = await axios.get(url, { timeout: 15000 });
+  return data;
 }
 
-async function meteoraPoolPrice(poolAddr) {
-  // preço spot do pool
+async function meteoraPoolSpot(poolAddr) {
   const url = `https://dlmm.datapi.meteora.ag/pools/${poolAddr}`;
-  const data = await fetchJson(url, {}, 2);
+  const { data } = await axios.get(url, { timeout: 15000 });
   const px = Number(data?.current_price);
   return Number.isFinite(px) ? px : null;
 }
 
-async function rpc(method, params) {
-  if (!HELIUS_RPC) throw new Error("Missing HELIUS_API_KEY");
-  const body = { jsonrpc: "2.0", id: 1, method, params };
-  return fetchJson(
-    HELIUS_RPC,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
-    },
-    2
-  );
-}
-
-async function getTokenByOwnerAndMint(owner, mint) {
-  const out = await rpc("getTokenAccountsByOwner", [
-    owner,
-    { mint },
-    { encoding: "jsonParsed" }
-  ]);
-  const arr = out?.result?.value || [];
-  let sum = 0;
-  for (const it of arr) {
-    const uiAmt = it?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
-    const n = Number(uiAmt);
-    if (Number.isFinite(n)) sum += n;
-  }
-  return sum;
-}
-
-async function getNativeSol(owner) {
-  // SOL nativo (lamports) do owner
-  const out = await rpc("getBalance", [owner]);
-  const lamports = Number(out?.result?.value ?? 0);
-  if (!Number.isFinite(lamports)) return 0;
-  return lamports / 1e9;
-}
-
-// ---------- route ----------
+// ---------- routes ----------
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "meteora-lp-reader", endpoints: ["/lp/:positionId"] });
+  res.json({
+    ok: true,
+    service: "meteora-dlmm-backend",
+    endpoints: ["/lp/:positionId"]
+  });
 });
 
 app.get("/lp/:positionId", async (req, res) => {
@@ -91,45 +91,100 @@ app.get("/lp/:positionId", async (req, res) => {
     const positionId = (req.params.positionId || "").trim();
     if (!positionId) return res.status(400).json({ ok: false, error: "missing positionId" });
 
+    const positionPubkey = new PublicKey(positionId);
+
+    // 1) Descobre a pool (lbPair) pela API da Meteora
     const raw = await meteoraPosition(positionId);
+    const lbPairAddr = raw?.pair_address || raw?.pairAddress || null;
+    if (!lbPairAddr) {
+      return res.status(404).json({ ok: false, error: "pair_address não encontrado para essa posição" });
+    }
 
-    const pool = raw?.pair_address || raw?.pairAddress || raw?.pool || null;
-    const owner = raw?.owner || null;
+    const lbPairPubkey = new PublicKey(lbPairAddr);
 
-    const spot = pool ? await meteoraPoolPrice(pool) : null;
+    // 2) SDK DLMM: lê bins on-chain e calcula amounts da POSIÇÃO (não da carteira)
+    const dlmmPool = await DLMM.create(connection, lbPairPubkey);
+
+    // OBS: dependendo da versão do SDK, pode ser getPosition() ou getPositionByPublicKey().
+    // Aqui tentamos getPosition primeiro e fazemos fallback.
+    let position;
+    if (typeof dlmmPool.getPosition === "function") {
+      position = await dlmmPool.getPosition(positionPubkey);
+    } else if (typeof dlmmPool.getPositionByPublicKey === "function") {
+      position = await dlmmPool.getPositionByPublicKey(positionPubkey);
+    } else {
+      return res.status(500).json({ ok: false, error: "SDK DLMM não tem método getPosition()" });
+    }
+
+    if (!position) {
+      return res.status(404).json({ ok: false, error: "posição não encontrada on-chain via SDK" });
+    }
+
+    // 3) Spot
+    const spot = await meteoraPoolSpot(lbPairAddr);
+
+    // 4) Token metadata (mints/decimals)
+    const tokenX = dlmmPool.tokenX;
+    const tokenY = dlmmPool.tokenY;
+
+    const dx = tokenX?.decimals ?? tokenX?.decimal ?? 0;
+    const dy = tokenY?.decimals ?? tokenY?.decimal ?? 0;
+
+    // 5) Amounts (RAW) -> decimal
+    const rawX = toBigIntSafe(position.totalXAmount ?? position.total_x_amount ?? position.totalX ?? null);
+    const rawY = toBigIntSafe(position.totalYAmount ?? position.total_y_amount ?? position.totalY ?? null);
+
+    const qX_str = toDecimalString(rawX, dx);
+    const uY_str = toDecimalString(rawY, dy);
+
+    // como tu quer SOL/USDC: precisamos mapear qual lado é SOL e qual é USDC
+    const mintX = tokenX?.publicKey?.toBase58?.() || tokenX?.mint?.toBase58?.() || null;
+    const mintY = tokenY?.publicKey?.toBase58?.() || tokenY?.mint?.toBase58?.() || null;
+
+    // mints oficiais
+    const MINT_WSOL = "So11111111111111111111111111111111111111112";
+    const MINT_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
     let q_sol = null;
     let u_usdc = null;
+
+    // se tokenX é SOL, tokenY é USDC (ou vice-versa)
+    if (mintX === MINT_WSOL) q_sol = qX_str;
+    if (mintY === MINT_WSOL) q_sol = qY_str;
+
+    if (mintX === MINT_USDC) u_usdc = qX_str;
+    if (mintY === MINT_USDC) u_usdc = qY_str;
+
+    // 6) total USD (aprox, pra dashboard)
     let lp_total_usd = null;
+    const q_sol_num = q_sol ? Number(q_sol) : null;
+    const u_usdc_num = u_usdc ? Number(u_usdc) : null;
 
-    if (owner && HELIUS_RPC) {
-      // WSOL + SOL nativo
-      const wsol = await getTokenByOwnerAndMint(owner, MINT_WSOL);
-      const native = await getNativeSol(owner);
-      q_sol = (wsol || 0) + (native || 0);
-
-      u_usdc = await getTokenByOwnerAndMint(owner, MINT_USDC);
-
-      if (Number.isFinite(spot)) {
-        lp_total_usd = (q_sol * spot) + u_usdc;
-      }
+    if (Number.isFinite(spot) && Number.isFinite(q_sol_num) && Number.isFinite(u_usdc_num)) {
+      lp_total_usd = (q_sol_num * spot) + u_usdc_num;
     }
 
-    res.json({
+    return res.json({
       ok: true,
       positionId,
-      pool,
-      owner,
+      pool: lbPairAddr,
       spot,
+      tokenXMint: mintX,
+      tokenYMint: mintY,
+      tokenXDecimals: dx,
+      tokenYDecimals: dy,
+
+      // valores “mastigados”
       q_sol,
       u_usdc,
       lp_total_usd,
-      raw
+
+      // raw meteora (pra debug)
+      raw_position_meta: raw
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`meteora-lp-reader listening on :${port}`));
+app.listen(PORT, () => console.log(`meteora-dlmm-backend listening on :${PORT}`));
