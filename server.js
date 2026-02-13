@@ -1,44 +1,58 @@
 const express = require("express");
 const axios = require("axios");
 const { Connection, PublicKey } = require("@solana/web3.js");
-require("dotenv").config();
+
+// ✅ Import robusto (funciona em CJS mesmo quando o pacote exporta diferente)
+const dlmmPkg = require("@meteora-ag/dlmm");
+const DLMM = dlmmPkg?.DLMM || dlmmPkg?.default || dlmmPkg;
 
 const app = express();
 app.use(express.json());
 
+// ===== Config =====
 const HELIUS_KEY = process.env.HELIUS_API_KEY || "";
-const RPC_ENDPOINT = HELIUS_KEY
+const RPC_URL = HELIUS_KEY
   ? `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(HELIUS_KEY)}`
-  : null;
+  : "";
 
-const PORT = process.env.PORT || 10000;
+// ⚠️ "confirmed" costuma ser mais rápido/estável que "finalized"
+const connection = RPC_URL ? new Connection(RPC_URL, "confirmed") : null;
 
-// conexão RPC (Helius)
-const connection = RPC_ENDPOINT ? new Connection(RPC_ENDPOINT, "confirmed") : null;
+// ===== Cache simples (memória) =====
+const CACHE_TTL_MS = 15_000; // 15s
+const cache = new Map();
+function cacheGet(key) {
+  const it = cache.get(key);
+  if (!it) return null;
+  if (Date.now() > it.exp) { cache.delete(key); return null; }
+  return it.val;
+}
+function cacheSet(key, val, ttlMs = CACHE_TTL_MS) {
+  cache.set(key, { val, exp: Date.now() + ttlMs });
+}
 
-// helper: pega pool address via API
-async function meteoraPosition(positionId) {
+// ===== Helpers =====
+async function getMeteoraPosition(positionId) {
   const url = `https://dlmm-api.meteora.ag/position/${positionId}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
+  const { data } = await axios.get(url, { timeout: 20_000 });
   return data;
 }
 
-// helper: pega preço spot
-async function meteoraPoolSpot(poolAddr) {
+async function getMeteoraPoolSpot(poolAddr) {
   const url = `https://dlmm.datapi.meteora.ag/pools/${poolAddr}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  // já vimos que esse endpoint retorna current_price
-  const px = Number(data?.current_price);
+  const { data } = await axios.get(url, { timeout: 20_000 });
+
+  // na tua planilha tu tava usando current_price
+  const px = Number(data?.current_price ?? data?.price ?? data?.spot_price);
   return Number.isFinite(px) ? px : null;
 }
 
-// ✅ Import dinâmico do DLMM (resolve CommonJS vs ESM)
-async function getDLMM() {
-  const mod = await import("@meteora-ag/dlmm");
-  // alguns builds expõem default, outros expõem DLMM direto
-  return mod?.default || mod?.DLMM || mod;
+function toNumberSafe(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
 }
 
+// ===== Rotas =====
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -47,81 +61,115 @@ app.get("/", (req, res) => {
   });
 });
 
+/**
+ * Retorna o saldo REAL da posição DLMM (pool),
+ * calculado via SDK (on-chain bins).
+ */
 app.get("/lp/:positionId", async (req, res) => {
+  // aumenta timeout do response (evita cortar cedo do lado do node)
+  req.setTimeout(60_000);
+  res.setTimeout(60_000);
+
+  const positionId = (req.params.positionId || "").trim();
+  if (!positionId) return res.status(400).json({ ok: false, error: "missing positionId" });
+
+  if (!HELIUS_KEY || !connection) {
+    return res.status(500).json({ ok: false, error: "Missing HELIUS_API_KEY in Render Environment" });
+  }
+
+  const cacheKey = `lp:${positionId}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
   try {
-    const positionId = (req.params.positionId || "").trim();
-    if (!positionId) return res.status(400).json({ ok: false, error: "missing positionId" });
-    if (!connection) return res.status(500).json({ ok: false, error: "Missing HELIUS_API_KEY (Render env var)" });
+    // 1) Descobrir pool (lbPair) pela API pública
+    const meta = await getMeteoraPosition(positionId);
+    const pool = meta?.pair_address || meta?.pairAddress || meta?.pool;
+    if (!pool) return res.status(404).json({ ok: false, error: "Pool não encontrada para esta posição." });
 
-    // 1) Descobre a pool (LB Pair) via API
-    const raw = await meteoraPosition(positionId);
-    const pool = raw?.pair_address || raw?.pairAddress || raw?.pool || null;
-    if (!pool) return res.status(404).json({ ok: false, error: "Pool não encontrada para essa positionId", raw });
+    // 2) Spot do pool
+    const spot = await getMeteoraPoolSpot(pool);
 
-    // 2) SDK DLMM: carrega pool e calcula amounts ON-CHAIN
-    const DLMM = await getDLMM();
+    // 3) SDK DLMM: carrega pool e posição (faz a matemática dos bins)
+    if (!DLMM || typeof DLMM.create !== "function") {
+      return res.status(500).json({
+        ok: false,
+        error: "DLMM SDK not loaded (DLMM.create missing). Check @meteora-ag/dlmm import."
+      });
+    }
 
-    const lbPairPubkey = new PublicKey(pool);
-    const positionPubkey = new PublicKey(positionId);
+    const poolPk = new PublicKey(pool);
+    const posPk = new PublicKey(positionId);
 
-    // create(connection, poolAddress)
-    const dlmmPool = await DLMM.create(connection, lbPairPubkey);
+    const dlmmPool = await DLMM.create(connection, poolPk);
 
-    // getPosition(positionPubkey) -> puxa bins/binArrays necessários
-    const position = await dlmmPool.getPosition(positionPubkey);
-    if (!position) return res.status(404).json({ ok: false, error: "Posição não encontrada on-chain (SDK)", pool, positionId });
+    // ✅ este é o ponto: pega a posição ON-CHAIN e calcula totalX/totalY
+    const position = await dlmmPool.getPosition(posPk);
 
-    // 3) preço spot
-    const spot = await meteoraPoolSpot(pool);
+    if (!position) {
+      return res.status(404).json({ ok: false, error: "Posição não encontrada on-chain via SDK." });
+    }
 
-    // 4) converte amounts (SDK geralmente retorna BN/bigint/string)
+    // tokenX/tokenY vêm do pool (decimals corretos)
     const tokenX = dlmmPool.tokenX;
     const tokenY = dlmmPool.tokenY;
 
-    const totalXRaw = Number(position.totalXAmount ?? 0);
-    const totalYRaw = Number(position.totalYAmount ?? 0);
+    // o SDK geralmente entrega totalXAmount/totalYAmount em unidade "raw"
+    const xRaw = toNumberSafe(position.totalXAmount);
+    const yRaw = toNumberSafe(position.totalYAmount);
 
-    const q_x = Number.isFinite(totalXRaw) ? totalXRaw / Math.pow(10, tokenX.decimal) : null;
-    const u_y = Number.isFinite(totalYRaw) ? totalYRaw / Math.pow(10, tokenY.decimal) : null;
+    const q_x = xRaw !== null ? xRaw / Math.pow(10, tokenX.decimal) : null;
+    const u_y = yRaw !== null ? yRaw / Math.pow(10, tokenY.decimal) : null;
 
-    // dependendo da pool, X pode ser SOL e Y USDC (ou inverso). Vamos devolver genérico + também SOL/USDC quando bater.
-    let q_sol = null, u_usdc = null;
+    // Atenção: na SOL/USDC, normalmente X = SOL e Y = USDC (mas pode inverter).
+    // Vamos expor também os mints pra tu validar.
+    let q_sol = null;
+    let u_usdc = null;
 
-    const mintX = tokenX.publicKey.toBase58();
-    const mintY = tokenY.publicKey.toBase58();
-
-    const MINT_WSOL = "So11111111111111111111111111111111111111112";
-    const MINT_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-    if (mintX === MINT_WSOL) q_sol = q_x;
-    if (mintY === MINT_WSOL) q_sol = u_y;
-
-    if (mintX === MINT_USDC) u_usdc = q_x;
-    if (mintY === MINT_USDC) u_usdc = u_y;
-
-    let lp_total_usd = null;
-    if (Number.isFinite(spot) && Number.isFinite(q_sol) && Number.isFinite(u_usdc)) {
-      lp_total_usd = (q_sol * spot) + u_usdc;
+    if (tokenX?.publicKey?.toBase58() === "So11111111111111111111111111111111111111112") {
+      q_sol = q_x;
+      u_usdc = u_y;
+    } else {
+      // invertido
+      q_sol = u_y;
+      u_usdc = q_x;
     }
 
-    res.json({
+    const lp_total_usd =
+      Number.isFinite(spot) && Number.isFinite(q_sol) && Number.isFinite(u_usdc)
+        ? (q_sol * spot) + u_usdc
+        : null;
+
+    const out = {
       ok: true,
       positionId,
       pool,
+      tokenXMint: tokenX.publicKey.toBase58(),
+      tokenYMint: tokenY.publicKey.toBase58(),
       spot,
-      tokenX: { mint: mintX, decimals: tokenX.decimal },
-      tokenY: { mint: mintY, decimals: tokenY.decimal },
-      q_x,
-      u_y,
       q_sol,
       u_usdc,
       lp_total_usd,
-      raw
-    });
+      // mantém raw/meta pra debug
+      meta
+    };
+
+    cacheSet(cacheKey, out);
+    return res.json(out);
 
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    const msg = String(e?.message || e);
+
+    // Se o SDK demorar demais ou RPC oscilar, tu vai ver isso aqui
+    return res.status(500).json({
+      ok: false,
+      error: msg,
+      hint:
+        "Se for timeout: Render free + RPC pesado. Tenta novamente, ou sobe TTL do cache, ou usa instância paga/mais rápida."
+    });
   }
 });
 
-app.listen(PORT, () => console.log(`meteora-lp-reader listening on :${PORT}`));
+// Render injeta PORT automaticamente
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log(`meteora-lp-reader listening on :${port}`));
