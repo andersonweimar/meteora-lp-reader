@@ -1,15 +1,14 @@
 {
   "name": "meteora-lp-reader",
-  "version": "2.0.1",
+  "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node --experimental-specifier-resolution=node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "^1.1.21",
     "@solana/web3.js": "^1.98.0",
-    "axios": "^1.7.9",
     "express": "^4.19.2"
   },
   "engines": {
