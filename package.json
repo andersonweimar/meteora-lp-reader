@@ -1,18 +1,405 @@
-{
-  "name": "meteora-lp-reader",
-  "version": "1.0.0",
-  "main": "server.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "@meteora-ag/dlmm": "^1.0.0",
-    "@solana/web3.js": "^1.95.4",
-    "express": "^4.19.2"
-  },
-  "engines": {
-    "node": "20.x"
-  }
+/***************
+ * v2 — Meteora + Hyperliquid + LOG + Trigger 1 min
+ * - Meteora via Render: GET /lp/:positionId
+ * - Hyperliquid: (A) via Render proxy endpoint OR (B) via HL public API (placeholder)
+ * - Auto-fill API_DATA!B22:B33 if fields exist in JSON (no formula changes)
+ * - Mirror to Inputs + Freeze μ/capital when positionId changes
+ * - Append LOG every run
+ ***************/
+
+const CFG = {
+  // ====== BACKEND (Meteora + opcional HL proxy) ======
+  RENDER_BASE_URL: "https://meteora-lp-reader.onrender.com",
+
+  // Se tu tiver um endpoint no teu backend pra HL, usa aqui:
+  // Exemplo: GET /hl/{wallet}/{coin}
+  // Retorna { ok:true, hl_price, funding_rate, position_sz, entry_px, pnl_usd, ... }
+  RENDER_HL_PATH_TEMPLATE: "/hl/{wallet}/{coin}",
+
+  // ====== SHEETS ======
+  SHEET_API: "API_DATA",
+  SHEET_INPUTS: "Inputs",
+  SHEET_CALC: "Calc",
+  SHEET_DASH: "Dashboard",
+  SHEET_LOG: "LOG",
+
+  // ====== API_DATA FIXOS (já existentes na tua planilha) ======
+  CELL_POSITION_ID: "B7",
+  CELL_LAST_UPDATE: "B6",
+  CELL_SPOT: "B9",
+
+  CELL_HL_PRICE: "B10",
+  CELL_HL_FUNDING_RATE: "B11",
+  CELL_HL_POS_SZ: "B12",
+  CELL_HL_ENTRY: "B13",
+  CELL_HL_PNL: "B14",
+  CELL_HL_FUNDING_ACC: "B15",
+  CELL_HL_FUNDING_8H: "B16",
+
+  CELL_LP_TOTAL_USD: "B18",
+  CELL_Q_SOL: "B19",
+  CELL_U_USDC: "B20",
+
+  // ====== API_DATA “HUB” B21:B33 (novo mapa) ======
+  HUB_HL_COIN: "B21",                 // "SOL"
+  HUB_FEECOEF_24H_TVL: "B22",         // 0.0031
+  HUB_ATR_1H_USD: "B23",              // ATR$ 1H
+  HUB_K_RANGE_MODE: "B24",            // "AUTO" / "MANUAL"
+  HUB_K_RANGE_MANUAL: "B25",          // number
+  HUB_RESETCOST_USDC: "B26",          // number
+  HUB_FUNDINGCOST_DAY: "B27",         // number
+  HUB_ATR_REF_PCT: "B28",             // 0.04
+  HUB_RANGE_REF_PCT: "B29",           // 0.10
+  HUB_ATR_TO_SIGMA_FACTOR: "B30",     // 1.25
+  HUB_COOLDOWN_MIN: "B31",            // 10
+  HUB_TARGETRESET_MIN: "B32",         // 90
+  HUB_FEECAPTURE_BOOST: "B33",        // 1.0-2.0
+
+  // ====== INPUTS ESPELHO ======
+  INPUT_P_CURRENT: "B6",
+  INPUT_MU_ENTRY: "B5",
+  INPUT_CAPITAL: "B7",
+  INPUT_LP_Q: "B12",
+  INPUT_LP_U: "B13",
+
+  // ATR + k_range (se tu usa Inputs!B17/B18 como no teu layout)
+  INPUT_ATR_1H: "B17",
+  INPUT_K_RANGE: "B18",
+
+  // ====== CALC REFS ======
+  CALC_Z_ABS: "E11",
+  CALC_MODO: "B13",
+  CALC_HEDGE_TARGET: "B17",
+  CALC_DELTA_QTY: "B18",
+
+  TRIGGER_MINUTES: 1
+};
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Meteora/Hedge")
+    .addItem("Refresh (Meteora+HL)", "refreshAll")
+    .addItem("Refresh + Freeze μ/capital + LOG", "refreshFreezeLog")
+    .addSeparator()
+    .addItem("Install trigger (auto 1 min)", "installTrigger")
+    .addItem("Remove trigger(s)", "removeTriggers")
+    .addToUi();
 }
 
+/**
+ * Public: refresh only (no freeze, no log)
+ */
+function refreshAll() {
+  const data = refreshAll_({ freezeIfPidChanged: false, appendLog: false });
+  return data;
+}
+
+/**
+ * Public: refresh + freeze + log
+ */
+function refreshFreezeLog() {
+  const data = refreshAll_({ freezeIfPidChanged: true, appendLog: true });
+  return data;
+}
+
+function refreshAll_({ freezeIfPidChanged, appendLog }) {
+  const ss = SpreadsheetApp.getActive();
+  const shApi = ss.getSheetByName(CFG.SHEET_API);
+  const shIn = ss.getSheetByName(CFG.SHEET_INPUTS);
+  const shCalc = ss.getSheetByName(CFG.SHEET_CALC);
+
+  if (!shApi || !shIn) throw new Error("Aba API_DATA ou Inputs não encontrada.");
+
+  const props = PropertiesService.getScriptProperties();
+  const positionId = String(shApi.getRange(CFG.CELL_POSITION_ID).getValue() || "").trim();
+  if (!positionId) throw new Error("API_DATA!B7 (Position ID) está vazio.");
+
+  const lastPid = String(props.getProperty("LAST_POSITION_ID") || "").trim();
+
+  // 1) Meteora (Render)
+  const lp = fetchMeteoraFromRender_(positionId);
+
+  // escreve API_DATA + Inputs (LP)
+  writeMeteora_(ss, lp);
+
+  // 2) HL (proxy Render) — se tiver wallet e coin
+  const wallet = String(shApi.getRange("B4").getValue() || "").trim(); // teu wallet HL em API_DATA!B4 (pelo print)
+  const coin = String(shApi.getRange(CFG.HUB_HL_COIN).getValue() || "SOL").trim();
+
+  let hl = null;
+  if (wallet) {
+    hl = fetchHL_(wallet, coin); // tenta proxy; se falhar, deixa vazio sem quebrar
+    if (hl) writeHL_(ss, hl);
+  }
+
+  // 3) Auto-fill HUB B22:B33 se backend trouxer (sem mexer em fórmulas)
+  // aceita de lp.meta.* ou hl.meta.* (tu escolhe no backend)
+  autoFillHubIfPresent_(ss, lp, hl);
+
+  // 4) freeze μ/capital se PID mudou
+  if (freezeIfPidChanged) {
+    if (positionId && positionId !== lastPid) {
+      // μ = spot atual
+      if (isFiniteNum_(lp.spot)) shIn.getRange(CFG.INPUT_MU_ENTRY).setValue(Number(lp.spot));
+      // capital = lp_total_usd
+      if (isFiniteNum_(lp.lp_total_usd)) shIn.getRange(CFG.INPUT_CAPITAL).setValue(Number(lp.lp_total_usd));
+
+      props.setProperty("LAST_POSITION_ID", positionId);
+      props.setProperty("LAST_FREEZE_AT", new Date().toISOString());
+    } else if (!lastPid && positionId) {
+      props.setProperty("LAST_POSITION_ID", positionId);
+    }
+  }
+
+  // 5) LOG
+  if (appendLog) {
+    appendLogRow_(ss, lp, hl, shCalc);
+  }
+
+  shApi.getRange(CFG.CELL_LAST_UPDATE).setValue(new Date());
+  return { lp, hl };
+}
+
+// ---------------------------
+// Meteora (Render) fetch/write
+// ---------------------------
+function fetchMeteoraFromRender_(positionId) {
+  const url = `${CFG.RENDER_BASE_URL}/lp/${encodeURIComponent(positionId)}`;
+  const resp = UrlFetchApp.fetch(url, {
+    method: "get",
+    muteHttpExceptions: true,
+    followRedirects: true,
+    headers: { accept: "application/json" }
+  });
+
+  const code = resp.getResponseCode();
+  const text = resp.getContentText() || "";
+  if (code < 200 || code >= 300) throw new Error(`Render HTTP ${code}: ${text.slice(0, 400)}`);
+
+  const data = JSON.parse(text);
+  if (!data || data.ok !== true) throw new Error(`Render ok=false: ${text.slice(0, 600)}`);
+
+  return data;
+}
+
+function writeMeteora_(ss, lp) {
+  const shApi = ss.getSheetByName(CFG.SHEET_API);
+  const shIn = ss.getSheetByName(CFG.SHEET_INPUTS);
+
+  const spot = numOrNull_(lp.spot);
+  const q_sol = numOrNull_(lp.q_sol);
+  const u_usdc = numOrNull_(lp.u_usdc);
+  const lp_total_usd = numOrNull_(lp.lp_total_usd);
+
+  if (spot !== null) shApi.getRange(CFG.CELL_SPOT).setValue(spot);
+  if (lp_total_usd !== null) shApi.getRange(CFG.CELL_LP_TOTAL_USD).setValue(lp_total_usd);
+  if (q_sol !== null) shApi.getRange(CFG.CELL_Q_SOL).setValue(q_sol);
+  if (u_usdc !== null) shApi.getRange(CFG.CELL_U_USDC).setValue(u_usdc);
+
+  // Inputs mirror
+  if (spot !== null) shIn.getRange(CFG.INPUT_P_CURRENT).setValue(spot);
+  if (q_sol !== null) shIn.getRange(CFG.INPUT_LP_Q).setValue(q_sol);
+  if (u_usdc !== null) shIn.getRange(CFG.INPUT_LP_U).setValue(u_usdc);
+
+  // Se backend já mandar ATR$1H, também espelha pro Inputs
+  const atr1h = numOrNull_(lp?.meta?.atr_1h_usd);
+  if (atr1h !== null) shIn.getRange(CFG.INPUT_ATR_1H).setValue(atr1h);
+}
+
+// ---------------------------
+// Hyperliquid fetch/write
+// ---------------------------
+function fetchHL_(wallet, coin) {
+  // Prioridade: teu Render proxy (mais estável pra ti)
+  try {
+    const path = CFG.RENDER_HL_PATH_TEMPLATE
+      .replace("{wallet}", encodeURIComponent(wallet))
+      .replace("{coin}", encodeURIComponent(coin));
+    const url = `${CFG.RENDER_BASE_URL}${path}`;
+
+    const resp = UrlFetchApp.fetch(url, {
+      method: "get",
+      muteHttpExceptions: true,
+      followRedirects: true,
+      headers: { accept: "application/json" }
+    });
+
+    const code = resp.getResponseCode();
+    const text = resp.getContentText() || "";
+    if (code >= 200 && code < 300) {
+      const data = JSON.parse(text);
+      if (data && data.ok === true) return data;
+    }
+  } catch (e) {
+    // não quebra o fluxo
+  }
+
+  // Fallback: sem HL
+  return null;
+}
+
+function writeHL_(ss, hl) {
+  const shApi = ss.getSheetByName(CFG.SHEET_API);
+
+  const hl_price = numOrNull_(hl.hl_price);
+  const funding_rate = numOrNull_(hl.funding_rate);
+  const position_sz = numOrNull_(hl.position_sz);
+  const entry_px = numOrNull_(hl.entry_px);
+  const pnl_usd = numOrNull_(hl.pnl_usd);
+  const funding_acc = numOrNull_(hl.funding_acc_usd);
+  const funding_8h = numOrNull_(hl.funding_8h_usd);
+
+  if (hl_price !== null) shApi.getRange(CFG.CELL_HL_PRICE).setValue(hl_price);
+  if (funding_rate !== null) shApi.getRange(CFG.CELL_HL_FUNDING_RATE).setValue(funding_rate);
+  if (position_sz !== null) shApi.getRange(CFG.CELL_HL_POS_SZ).setValue(position_sz);
+  if (entry_px !== null) shApi.getRange(CFG.CELL_HL_ENTRY).setValue(entry_px);
+  if (pnl_usd !== null) shApi.getRange(CFG.CELL_HL_PNL).setValue(pnl_usd);
+  if (funding_acc !== null) shApi.getRange(CFG.CELL_HL_FUNDING_ACC).setValue(funding_acc);
+  if (funding_8h !== null) shApi.getRange(CFG.CELL_HL_FUNDING_8H).setValue(funding_8h);
+}
+
+// ---------------------------
+// Auto-fill HUB B22:B33 if present
+// ---------------------------
+function autoFillHubIfPresent_(ss, lp, hl) {
+  const shApi = ss.getSheetByName(CFG.SHEET_API);
+
+  // Aceita valores vindo do backend em lp.meta.* ou hl.meta.*
+  const meta = Object.assign({}, lp?.meta || {}, hl?.meta || {});
+
+  // Se não existe, não escreve (não quebra)
+  writeIfNum_(shApi, CFG.HUB_FEECOEF_24H_TVL, meta.feeCoef_24h_feeTVL);
+  writeIfNum_(shApi, CFG.HUB_ATR_1H_USD, meta.atr_1h_usd);
+
+  writeIfText_(shApi, CFG.HUB_K_RANGE_MODE, meta.k_range_mode);
+  writeIfNum_(shApi, CFG.HUB_K_RANGE_MANUAL, meta.k_range_manual);
+
+  writeIfNum_(shApi, CFG.HUB_RESETCOST_USDC, meta.resetCost_usdc);
+  writeIfNum_(shApi, CFG.HUB_FUNDINGCOST_DAY, meta.fundingCost_usdc_day);
+
+  writeIfNum_(shApi, CFG.HUB_ATR_REF_PCT, meta.atr_ref_pct);
+  writeIfNum_(shApi, CFG.HUB_RANGE_REF_PCT, meta.range_ref_pct);
+  writeIfNum_(shApi, CFG.HUB_ATR_TO_SIGMA_FACTOR, meta.atr_to_sigma_factor);
+
+  writeIfNum_(shApi, CFG.HUB_COOLDOWN_MIN, meta.cooldown_min);
+  writeIfNum_(shApi, CFG.HUB_TARGETRESET_MIN, meta.targetReset_min);
+
+  writeIfNum_(shApi, CFG.HUB_FEECAPTURE_BOOST, meta.feeCapture_boost);
+
+  // coin (opcional)
+  writeIfText_(shApi, CFG.HUB_HL_COIN, meta.hl_coin);
+}
+
+// ---------------------------
+// LOG
+// ---------------------------
+function appendLogRow_(ss, lp, hl, shCalc) {
+  const shLog = ensureLogSheet_(ss);
+
+  const ts = new Date();
+  const positionId = String(lp.positionId || "");
+  const spot = numOrNull_(lp.spot);
+  const q_sol = numOrNull_(lp.q_sol);
+  const u_usdc = numOrNull_(lp.u_usdc);
+  const lp_total_usd = numOrNull_(lp.lp_total_usd);
+
+  const z_abs = shCalc ? numOrNull_(shCalc.getRange(CFG.CALC_Z_ABS).getValue()) : null;
+  const modo = shCalc ? String(shCalc.getRange(CFG.CALC_MODO).getValue() || "") : "";
+  const hedge_target = shCalc ? numOrNull_(shCalc.getRange(CFG.CALC_HEDGE_TARGET).getValue()) : null;
+  const delta_qty = shCalc ? numOrNull_(shCalc.getRange(CFG.CALC_DELTA_QTY).getValue()) : null;
+
+  const hl_price = numOrNull_(hl?.hl_price);
+  const hl_pos = numOrNull_(hl?.position_sz);
+  const hl_entry = numOrNull_(hl?.entry_px);
+  const hl_pnl = numOrNull_(hl?.pnl_usd);
+  const hl_funding = numOrNull_(hl?.funding_rate);
+
+  const action =
+    modo.startsWith("SAÍDA") ? "EXIT" :
+    modo.startsWith("RAMP") ? "RAMP" : "HOLD";
+
+  shLog.appendRow([
+    ts,
+    positionId,
+    spot,
+    z_abs,
+    modo,
+    q_sol,
+    u_usdc,
+    lp_total_usd,
+    hedge_target,
+    delta_qty,
+    action,
+    hl_price,
+    hl_pos,
+    hl_entry,
+    hl_pnl,
+    hl_funding
+  ]);
+}
+
+function ensureLogSheet_(ss) {
+  let sh = ss.getSheetByName(CFG.SHEET_LOG);
+  if (sh) return sh;
+
+  sh = ss.insertSheet(CFG.SHEET_LOG);
+  sh.getRange(1, 1, 1, 16).setValues([[
+    "timestamp",
+    "positionId",
+    "spot",
+    "z_abs",
+    "modo",
+    "q_sol",
+    "u_usdc",
+    "lp_total_usd",
+    "hedge_qty_target",
+    "hedge_delta_exec",
+    "action",
+    "hl_price",
+    "hl_position_sz",
+    "hl_entry_px",
+    "hl_pnl_usd",
+    "hl_funding_rate"
+  ]]);
+  sh.setFrozenRows(1);
+  return sh;
+}
+
+// ---------------------------
+// Triggers
+// ---------------------------
+function installTrigger() {
+  removeTriggers();
+  ScriptApp.newTrigger("refreshFreezeLog")
+    .timeBased()
+    .everyMinutes(CFG.TRIGGER_MINUTES)
+    .create();
+}
+
+function removeTriggers() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    const fn = t.getHandlerFunction();
+    if (fn === "refreshFreezeLog" || fn === "refreshAll") ScriptApp.deleteTrigger(t);
+  });
+}
+
+// ---------------------------
+// utils
+// ---------------------------
+function numOrNull_(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function isFiniteNum_(v) {
+  const n = Number(v);
+  return Number.isFinite(n);
+}
+function writeIfNum_(sh, a1, v) {
+  const n = numOrNull_(v);
+  if (n !== null) sh.getRange(a1).setValue(n);
+}
+function writeIfText_(sh, a1, v) {
+  if (v === null || v === undefined || v === "") return;
+  sh.getRange(a1).setValue(String(v));
+}
