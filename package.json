@@ -1,25 +1,16 @@
 {
-  "ok": true,
-  "hl_price": 84.64,
-  "funding_rate": -0.00003,
-  "position_sz": 6.52,
-  "entry_px": 87.10,
-  "pnl_usd": -12.34,
-  "funding_acc_usd": 0.0014,
-  "funding_8h_usd": 0.00,
-  "meta": {
-    "hl_coin": "SOL",
-    "feeCoef_24h_feeTVL": 0.0031,
-    "atr_1h_usd": 4.0,
-    "k_range_mode": "AUTO",
-    "k_range_manual": 2,
-    "resetCost_usdc": 2,
-    "fundingCost_usdc_day": 0,
-    "atr_ref_pct": 0.04,
-    "range_ref_pct": 0.10,
-    "atr_to_sigma_factor": 1.25,
-    "cooldown_min": 10,
-    "targetReset_min": 90,
-    "feeCapture_boost": 1.0
+  "name": "meteora-lp-reader",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
