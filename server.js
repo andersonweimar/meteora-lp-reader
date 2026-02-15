@@ -1,4 +1,44 @@
-// ===== HL helpers (Hyperliquid /info) =====
+const express = require("express");
+const cors = require("cors");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ============================
+// HEALTH
+// ============================
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "meteora-lp-reader", ts: new Date().toISOString() });
+});
+
+// ============================
+// METEORA LP (placeholder)
+// ============================
+// ⚠️ IMPORTANTE:
+// Aqui tu deve colar a tua implementação que já funcionava.
+// Se tu já tem /lp/:positionId funcionando, mantém a tua e IGNORA esta.
+app.get("/lp/:positionId", async (req, res) => {
+  try {
+    const positionId = String(req.params.positionId || "").trim();
+    if (!positionId) return res.status(400).json({ ok: false, error: "positionId vazio" });
+
+    // TODO: SUBSTITUIR pela tua lógica Meteora real (a que já funcionava)
+    // Retorno mínimo esperado pelo Apps Script:
+    // { ok:true, positionId, spot, q_sol, u_usdc, lp_total_usd, meta?: {...} }
+
+    return res.status(501).json({
+      ok: false,
+      error: "Implementa aqui tua lógica Meteora (cola a versão que já funcionava)."
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ============================
+// HYPERLIQUID HELPERS
+// ============================
 async function hlInfo(body) {
   const r = await fetch("https://api.hyperliquid.xyz/info", {
     method: "POST",
@@ -13,32 +53,31 @@ async function hlInfo(body) {
 }
 
 async function hlGetMidOrMark(coin) {
-  // 1) tenta allMids (mais simples)
+  // 1) allMids (mais simples)
   try {
-    const mids = await hlInfo({ type: "allMids" }); // { SOL: "123.45", ... }
+    const mids = await hlInfo({ type: "allMids" }); // { SOL:"123.4", ... }
     const v = mids?.[coin];
     const n = Number(v);
-    if (Number.isFinite(n)) return { mid: n, mark: n, source: "allMids" };
+    if (Number.isFinite(n)) return { px: n, source: "allMids" };
   } catch (_) {}
 
   // 2) fallback: metaAndAssetCtxs
   const metaCtx = await hlInfo({ type: "metaAndAssetCtxs" });
   const meta = metaCtx?.[0];
   const ctxs = metaCtx?.[1];
-
   const uni = meta?.universe || [];
+
   const idx = uni.findIndex(u => String(u?.name || "").toUpperCase() === String(coin).toUpperCase());
-  if (idx < 0 || !Array.isArray(ctxs) || !ctxs[idx]) return { mid: null, mark: null, source: "metaAndAssetCtxs" };
+  if (idx < 0 || !Array.isArray(ctxs) || !ctxs[idx]) return { px: null, source: "metaAndAssetCtxs" };
 
   const ctx = ctxs[idx];
   const mid = Number(ctx?.midPx);
-  const mark = Number(ctx?.markPx);
+  if (Number.isFinite(mid)) return { px: mid, source: "metaAndAssetCtxs.midPx" };
 
-  return {
-    mid: Number.isFinite(mid) ? mid : null,
-    mark: Number.isFinite(mark) ? mark : null,
-    source: "metaAndAssetCtxs",
-  };
+  const mark = Number(ctx?.markPx);
+  if (Number.isFinite(mark)) return { px: mark, source: "metaAndAssetCtxs.markPx" };
+
+  return { px: null, source: "metaAndAssetCtxs.none" };
 }
 
 async function hlGetPosition(wallet, coin) {
@@ -50,7 +89,6 @@ async function hlGetPosition(wallet, coin) {
 
   if (!p) return { posQty: 0, entryPx: null, pnlUsd: null, fundingAccUsd: null };
 
-  // HL costuma ter szi com sinal (short negativo). A planilha quer "short+" => abs()
   const szi = Number(p?.szi ?? p?.size ?? p?.positionSize);
   const entry = Number(p?.entryPx ?? p?.avgPx ?? p?.averageEntryPrice);
   const pnl = Number(p?.unrealizedPnl ?? p?.pnl);
@@ -64,8 +102,38 @@ async function hlGetPosition(wallet, coin) {
   };
 }
 
-// ===== HL route: /hl/:wallet/:coin =====
-// Retorna exatamente o formato que o Apps Script espera
+// ============================
+// HL ROUTES
+// ============================
+
+// /hl/:wallet (default SOL)
+app.get("/hl/:wallet", async (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || "").trim();
+    if (!wallet) return res.status(400).json({ ok: false, error: "wallet vazio" });
+
+    const coin = "SOL";
+    const px = await hlGetMidOrMark(coin);
+    const pos = await hlGetPosition(wallet, coin);
+
+    return res.json({
+      ok: true,
+      hl_price: px.px,
+      funding_rate: null,
+      position_sz: pos.posQty,
+      entry_px: pos.entryPx,
+      pnl_usd: pos.pnlUsd,
+      funding_acc_usd: pos.fundingAccUsd,
+      funding_8h_usd: null,
+      meta: { hl_coin: coin },
+      debug: { source: px.source }
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// /hl/:wallet/:coin (coin explícito)
 app.get("/hl/:wallet/:coin", async (req, res) => {
   try {
     const wallet = String(req.params.wallet || "").trim();
@@ -75,39 +143,25 @@ app.get("/hl/:wallet/:coin", async (req, res) => {
     const px = await hlGetMidOrMark(coin);
     const pos = await hlGetPosition(wallet, coin);
 
-    // funding_rate: a HL expõe vários campos dependendo do payload; aqui deixo null
-    // (se tu quiser, eu ajusto depois olhando teu JSON real)
-    const payload = {
+    return res.json({
       ok: true,
-      hl_price: px.mid ?? px.mark,
+      hl_price: px.px,
       funding_rate: null,
       position_sz: pos.posQty,
       entry_px: pos.entryPx,
       pnl_usd: pos.pnlUsd,
       funding_acc_usd: pos.fundingAccUsd,
       funding_8h_usd: null,
-      meta: {
-        hl_coin: coin,
-        // Se tu quiser auto-preencher o HUB, tu pode mandar essas chaves daqui também:
-        // feeCoef_24h_feeTVL: 0.0031,
-        // atr_1h_usd: 4.0,
-        // k_range_mode: "AUTO",
-        // k_range_manual: 2,
-        // resetCost_usdc: 2,
-        // fundingCost_usdc_day: 0,
-        // atr_ref_pct: 0.04,
-        // range_ref_pct: 0.10,
-        // atr_to_sigma_factor: 1.25,
-        // cooldown_min: 10,
-        // targetReset_min: 90,
-        // feeCapture_boost: 1.0
-      },
+      meta: { hl_coin: coin },
       debug: { source: px.source }
-    };
-
-    res.json(payload);
+    });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
+// ============================
+// START
+// ============================
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`listening on :${PORT}`));
