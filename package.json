@@ -8,6 +8,7 @@
   "funding_acc_usd": 0.0014,
   "funding_8h_usd": 0.00,
   "meta": {
+    "hl_coin": "SOL",
     "feeCoef_24h_feeTVL": 0.0031,
     "atr_1h_usd": 4.0,
     "k_range_mode": "AUTO",
@@ -19,7 +20,6 @@
     "atr_to_sigma_factor": 1.25,
     "cooldown_min": 10,
     "targetReset_min": 90,
-    "feeCapture_boost": 1.0,
-    "hl_coin": "SOL"
+    "feeCapture_boost": 1.0
   }
 }
