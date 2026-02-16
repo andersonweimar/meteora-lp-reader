@@ -1,4 +1,4 @@
-/* meteora-lp-reader — Meteora + Hyperliquid (stable)
+/* meteora-lp-reader — Meteora DLMM + Hyperliquid (stable build)
  * Endpoints:
  *  - GET /
  *  - GET /health
@@ -20,7 +20,7 @@ const HELIUS_RPC = HELIUS_KEY
   ? `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(HELIUS_KEY)}`
   : "";
 
-// "processed" = mais rápido no Render
+// "processed" = mais rápido e reduz timeout no Render
 const connection = HELIUS_RPC ? new Connection(HELIUS_RPC, "processed") : null;
 
 // -------------------- CONSTANTS --------------------
@@ -42,12 +42,26 @@ async function fetchJson(url, opts = {}, timeoutMs = 25000) {
     const res = await fetch(url, { ...opts, signal: controller.signal });
     const txt = await res.text();
     let json = null;
-    try { json = txt ? JSON.parse(txt) : null; } catch (_) {}
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${txt?.slice(0, 600)}`);
+    try {
+      json = txt ? JSON.parse(txt) : null;
+    } catch (_) {}
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${txt?.slice(0, 800)}`);
     return json;
   } finally {
     clearTimeout(t);
   }
+}
+
+async function postJson(url, bodyObj, timeoutMs = 25000) {
+  return fetchJson(
+    url,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(bodyObj),
+    },
+    timeoutMs
+  );
 }
 
 // -------------------- DLMM loader --------------------
@@ -56,16 +70,36 @@ function loadDLMM() {
   const DLMM = pkg?.DLMM || pkg?.default || pkg;
   if (!DLMM || typeof DLMM.create !== "function") {
     const keys = pkg ? Object.keys(pkg) : [];
-    throw new Error(`DLMM SDK not loaded (DLMM.create missing). exports keys=${keys.join(",")}`);
+    throw new Error(
+      `DLMM SDK not loaded (DLMM.create missing). exports keys=${keys.join(",")}`
+    );
   }
   return DLMM;
 }
+
 const DLMM = (() => {
-  try { return loadDLMM(); }
-  catch (e) { console.error("DLMM load error:", e?.message || e); return null; }
+  try {
+    return loadDLMM();
+  } catch (e) {
+    console.error("DLMM load error:", e?.message || e);
+    return null;
+  }
 })();
 
-// -------------------- helpers --------------------
+// -------------------- Meteora helpers --------------------
+async function meteoraPositionMeta(positionId) {
+  const url = `https://dlmm-api.meteora.ag/position/${positionId}`;
+  return fetchJson(url, {}, 20000);
+}
+
+async function meteoraPoolSpot(poolAddr) {
+  const url = `https://dlmm.datapi.meteora.ag/pools/${poolAddr}`;
+  const data = await fetchJson(url, {}, 20000);
+  const px = Number(data?.current_price ?? data?.price ?? data?.spot_price);
+  return Number.isFinite(px) ? px : null;
+}
+
+// -------------------- Big number helpers --------------------
 function toBigIntLoose(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === "bigint") return v;
@@ -97,46 +131,36 @@ function amountToNumber(bi, decimals) {
   return n / Math.pow(10, decimals);
 }
 
-// -------------------- Meteora helpers --------------------
-async function meteoraPositionMeta(positionId) {
-  const url = `https://dlmm-api.meteora.ag/position/${positionId}`;
-  return fetchJson(url, {}, 20000);
-}
-
-async function meteoraPoolSpot(poolAddr) {
-  const url = `https://dlmm.datapi.meteora.ag/pools/${poolAddr}`;
-  const data = await fetchJson(url, {}, 20000);
-  const px = Number(data?.current_price ?? data?.price ?? data?.spot_price);
-  return Number.isFinite(px) ? px : null;
-}
-
 // -------------------- Hyperliquid helpers --------------------
-const HL_INFO = "https://api.hyperliquid.xyz/info";
+const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
 
-async function hlPost(body) {
-  return fetchJson(HL_INFO, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  }, 20000);
+/**
+ * HL: all mids => { "SOL": "86.12", ... }
+ */
+async function hlAllMids() {
+  return postJson(HL_INFO_URL, { type: "allMids" }, 20000);
 }
 
-async function hlGetMid(coin) {
-  const mids = await hlPost({ type: "allMids" });
-  const px = Number(mids?.[coin]);
-  return Number.isFinite(px) ? px : null;
+/**
+ * HL: clearinghouseState => positions, margin, etc.
+ */
+async function hlClearinghouseState(wallet) {
+  // IMPORTANT: type é "clearinghouseState" (camelCase)
+  return postJson(HL_INFO_URL, { type: "clearinghouseState", user: wallet }, 20000);
 }
 
-async function hlUserState(wallet) {
-  return hlPost({ type: "userState", user: wallet });
+function toNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
 }
 
-function findCoinPosition(userState, coin) {
-  const arr = userState?.assetPositions || [];
-  for (const it of arr) {
-    const p = it?.position;
+function findCoinPosition(userState, coinUpper) {
+  const aps = userState?.assetPositions || [];
+  for (const ap of aps) {
+    const p = ap?.position;
     if (!p) continue;
-    if (String(p.coin || "").toUpperCase() === String(coin).toUpperCase()) return p;
+    const c = String(p.coin || "").toUpperCase();
+    if (c === coinUpper) return p;
   }
   return null;
 }
@@ -145,19 +169,27 @@ function findCoinPosition(userState, coin) {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "meteora+hyperliquid-backend",
-    endpoints: ["/health", "/lp/:positionId", "/hl/:wallet?coin=SOL"]
+    service: "meteora-dlmm-backend",
+    endpoints: ["/health", "/lp/:positionId", "/hl/:wallet?coin=SOL"],
   });
 });
 
 app.get("/health", async (req, res) => {
   try {
-    const out = { ok: true, heliusKeyPresent: !!HELIUS_KEY, rpcEndpoint: HELIUS_RPC ? "helius" : "missing" };
-    if (connection) out.solanaVersion = await connection.getVersion();
-    // HL quick ping
-    const mid = await hlGetMid("SOL");
-    out.hl_ok = mid !== null;
-    res.json(out);
+    if (!HELIUS_RPC || !connection) {
+      return res.json({
+        ok: true,
+        heliusKeyPresent: !!HELIUS_KEY,
+        rpcEndpoint: "missing",
+      });
+    }
+    const v = await connection.getVersion();
+    res.json({
+      ok: true,
+      heliusKeyPresent: !!HELIUS_KEY,
+      rpcEndpoint: "helius",
+      solanaVersion: v,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -171,16 +203,22 @@ app.get("/lp/:positionId", async (req, res) => {
     if (!HELIUS_RPC || !connection) return res.status(400).json({ ok: false, error: "Missing HELIUS_API_KEY env" });
     if (!DLMM) return res.status(500).json({ ok: false, error: "DLMM SDK failed to load (check logs)" });
 
+    // 1) meta -> pool + owner + fees claimed (se vier)
     const meta = await meteoraPositionMeta(positionId);
     const pool = meta?.pair_address || meta?.pairAddress || meta?.pool || meta?.lb_pair || null;
     const owner = meta?.owner || null;
-    if (!pool) return res.status(404).json({ ok: false, error: "pool not found for this positionId", meta });
+
+    if (!pool) {
+      return res.status(404).json({ ok: false, error: "pool not found for this positionId", meta });
+    }
 
     const poolPk = new PublicKey(pool);
     const positionPk = new PublicKey(positionId);
 
+    // 2) spot rápido
     const spot = await meteoraPoolSpot(pool);
 
+    // 3) cria pool instance
     const dlmmPool = await DLMM.create(connection, poolPk);
     const tokenX = dlmmPool?.tokenX;
     const tokenY = dlmmPool?.tokenY;
@@ -193,12 +231,14 @@ app.get("/lp/:positionId", async (req, res) => {
     if (!Number.isFinite(decX)) decX = decimalsByMint(tokenXMint);
     if (!Number.isFinite(decY)) decY = decimalsByMint(tokenYMint);
 
+    // 4) pega posição
     const pos = await dlmmPool.getPosition(positionPk);
     const pd = pos?.positionData || pos;
 
     const rawX =
       pick(pd, ["totalXAmount", "totalX", "amountX", "tokenXAmount"]) ??
       pick(pos, ["totalXAmount", "totalX", "amountX", "tokenXAmount"]);
+
     const rawY =
       pick(pd, ["totalYAmount", "totalY", "amountY", "tokenYAmount"]) ??
       pick(pos, ["totalYAmount", "totalY", "amountY", "tokenYAmount"]);
@@ -214,19 +254,17 @@ app.get("/lp/:positionId", async (req, res) => {
       lp_total_usd = (q_sol * spot) + u_usdc;
     }
 
-    // fees (se o SDK expuser feeX/feeY em positionData)
-    const feeX_raw = pick(pd, ["feeX", "fee_x", "feesX", "fee_x_amount"]);
-    const feeY_raw = pick(pd, ["feeY", "fee_y", "feesY", "fee_y_amount"]);
-    const feeX_bi = toBigIntLoose(feeX_raw);
-    const feeY_bi = toBigIntLoose(feeY_raw);
-    const fee_x = (feeX_bi !== null && decX !== null) ? amountToNumber(feeX_bi, decX) : null;
-    const fee_y = (feeY_bi !== null && decY !== null) ? amountToNumber(feeY_bi, decY) : null;
-
-    let fee_usd_est = null;
-    if (Number.isFinite(spot) && Number.isFinite(fee_x) && Number.isFinite(fee_y)) {
-      // assumindo tokenX=SOL e tokenY=USDC (teu caso)
-      fee_usd_est = fee_x * spot + fee_y;
-    }
+    // ---- meta fields úteis p/ planilha (se existirem no retorno do meteora)
+    const metaOut = {
+      // estes nomes batem com o que tu criou na API_DATA A34+
+      total_fee_x_claimed: meta?.total_fee_x_claimed ?? null,
+      total_fee_y_claimed: meta?.total_fee_y_claimed ?? null,
+      total_fee_usd_claimed: meta?.total_fee_usd_claimed ?? null,
+      total_reward_usd_claimed: meta?.total_reward_usd_claimed ?? null,
+      fee_apy_24h: meta?.fee_apy_24h ?? null,
+      fee_apr_24h: meta?.fee_apr_24h ?? null,
+      daily_fee_yield: meta?.daily_fee_yield ?? null,
+    };
 
     return res.json({
       ok: true,
@@ -239,13 +277,8 @@ app.get("/lp/:positionId", async (req, res) => {
       q_sol,
       u_usdc,
       lp_total_usd,
-
-      // novas métricas
-      fee_x,
-      fee_y,
-      fee_usd_est,
-
-      meta
+      meta: metaOut,
+      raw_meta: meta
     });
   } catch (e) {
     console.error("[lp] error:", e);
@@ -254,33 +287,47 @@ app.get("/lp/:positionId", async (req, res) => {
 });
 
 app.get("/hl/:wallet", async (req, res) => {
+  const wallet = (req.params.wallet || "").trim();
+  const coin = String(req.query.coin || "SOL").toUpperCase();
+
   try {
-    const wallet = String(req.params.wallet || "").trim();
-    const coin = String(req.query.coin || "SOL").toUpperCase().trim();
     if (!wallet) return res.status(400).json({ ok: false, error: "missing wallet" });
 
-    const hl_price = await hlGetMid(coin);
-    const us = await hlUserState(wallet);
-    const p = findCoinPosition(us, coin);
+    // 1) preço
+    const mids = await hlAllMids();
+    const hl_price = toNum(mids?.[coin]);
 
-    // position_sz: manter sinal do HL (positivo=LONG, negativo=SHORT)
-    const position_sz = p?.szi != null ? Number(p.szi) : null;
-    const entry_px = p?.entryPx != null ? Number(p.entryPx) : null;
-    const pnl_usd = p?.unrealizedPnl != null ? Number(p.unrealizedPnl) : null;
+    // 2) estado do usuário
+    const userState = await hlClearinghouseState(wallet);
+
+    // pega posição do coin (se existir)
+    const p = findCoinPosition(userState, coin);
+
+    // campos normalizados
+    const funding_rate = toNum(p?.cumFunding?.sinceOpen); // cuidado: pode não ser "rate"; é cum funding
+    const position_sz = toNum(p?.szi);                   // size (signed)
+    const entry_px = toNum(p?.entryPx);
+    const pnl_usd = toNum(p?.unrealizedPnl);
+
+    // funding acumulado em USD (se quiser mais “certo”, dá pra trocar depois por histórico userFunding)
+    // aqui uso cumFunding.sinceOpen (string) como proxy; tu pode evoluir isso depois.
+    const funding_acc_usd = null;
+    const funding_8h_usd = null;
 
     return res.json({
       ok: true,
       hl_price,
-      funding_rate: null,
+      funding_rate,
       position_sz,
       entry_px,
       pnl_usd,
-      funding_acc_usd: null,
-      funding_8h_usd: null,
+      funding_acc_usd,
+      funding_8h_usd,
       meta: { hl_coin: coin },
-      debug: { source: "allMids+userState" }
+      debug: { source: "allMids+clearinghouseState" }
     });
   } catch (e) {
+    console.error("[hl] error:", e);
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
