@@ -1,6 +1,6 @@
 {
   "name": "meteora-lp-reader",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "commonjs",
   "main": "server.js",
   "scripts": {
@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@meteora-ag/dlmm": "^1.0.0",
-    "@solana/web3.js": "^1.95.2",
+    "@solana/web3.js": "^1.95.3",
     "cors": "^2.8.5",
     "express": "^4.19.2"
   },
